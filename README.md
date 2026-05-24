@@ -10,23 +10,31 @@ Multi-Ops 是一个多机器远程运维平台，采用 Go 编写，支持通过
     HTTP + WebSocket
          |
    +-----------+
-   |  Master   |  :8080 -- 控制面，Web 看板、REST API、JWT 认证、审计日志
+   |  Master   |  内网 :8080 -- 控制面，Web 看板、REST API、JWT 认证、审计日志
    +-----------+
-         |
-    WebSocket
-         |
+         ↑
+         │  Gateway 主动连接 Master (WebSocket 出站)
+         │  Master 无需公网 IP
    +-----------+
-   | Gateway   |  :8081 -- 代理层，Token 认证，双向消息路由
+   | Gateway   |  公网 :8081 -- 代理层，Token 认证，双向消息路由
    +-----------+
-         |
-    WebSocket (多个连接)
-         |
+         ↑
+         │  Agent 主动连接 Gateway (WebSocket 出站)
+         │
   +------+------+
   |             |
 Agent A1    Agent A2   ...  -- 部署在目标机器上的轻量级客户端
   |             |
 (PTY)       (Shell)
 ```
+
+### 网络拓扑
+
+- **Master** 部署在**内网**，无需公网 IP。Gateway 通过 WebSocket 主动连接 Master。
+- **Gateway** 部署在**公网**（云服务器/DMZ），暴露 8081 端口供 Agent 连接。
+- **Agent** 部署在各目标机器上，通过 WebSocket 主动连接公网 Gateway。
+
+> 核心设计：所有连接都是**出站**的（Gateway→Master，Agent→Gateway），Master 和 Agent 都不需要公网 IP。
 
 ### 组件
 
@@ -167,13 +175,49 @@ systemctl restart multi-ops-agent  # 重启
 
 ## 部署方式
 
-### Docker Compose（开发测试）
+### Docker Compose（单机开发/测试）
+
+同一台机器上同时运行 Master 和 Gateway，自带健康检查、自动重启和审计日志持久化。适合开发、测试或内网使用。
+
+**1. 准备环境变量**
 
 ```bash
-docker-compose up --build
+cp .env.example .env
+
+# 生成安全随机值
+sed -i "s/JWT_SECRET=.*/JWT_SECRET=$(openssl rand -hex 32)/" .env
+sed -i "s|ADMIN_PASSWORD=.*|ADMIN_PASSWORD=$(openssl rand -base64 24)|" .env
+sed -i "s/AGENT_TOKENS=.*/AGENT_TOKENS=$(openssl rand -hex 16)/" .env
+sed -i "s/MASTER_SECRET=.*/MASTER_SECRET=$(openssl rand -hex 32)/" .env
 ```
 
-Master (`:8080`) 和 Gateway (`:8081`) 在容器中启动。Agent 仍需在目标机器上单独运行。
+**2. 启动**
+
+```bash
+docker compose up -d --build
+```
+
+服务启动后：
+- Master: `http://localhost:8080`
+- Gateway: `http://localhost:8081`
+- 健康检查: `docker compose ps`
+
+**3. 查看日志**
+
+```bash
+docker compose logs -f master     # Master 日志
+docker compose logs -f gateway    # Gateway 日志
+```
+
+**4. 更新**
+
+```bash
+git pull
+docker compose down
+docker compose up -d --build
+```
+
+> 注意：Agent 仍需在目标机器上单独运行，通过 Gateway 公网 IP 的 8081 端口连接。
 
 ### 手动部署（开发）
 
@@ -196,40 +240,57 @@ make dev-agent
 
 ### 生产环境部署
 
+Gateway 部署在公网（云服务器），Master 部署在内网。Gateway 通过 WebSocket **主动连接** Master，因此 Master 无需公网 IP。
+
 ```
-                    +-------------+
-                    |   Internet  |
-                    +------+------+
-                           |
-                    +------v------+
-                    |  反向代理    |  nginx / cloudflare (TLS 终止)
-                    +------+------+
-                           |
-              +------------+------------+
-              |                         |
-       +------v------+           +------v------+
-       |   Master    |           |   Gateway   |  DMZ 区域，Agent 可访问
-       |  :8080      |           |  :8081      |
-       +-------------+           +------+------+
-                                         |
-                              +----------+----------+
-                              |          |          |
-                        +-----v+   +----v+   +-----v+
-                        |Agent1|   |Agent2|   |Agent3|  目标机器
-                        +------+   +------+   +------+
+  公网                           内网
+ ┌──────────────┐              ┌──────────────────────────┐
+ │              │              │                          │
+ │   Browser ◄──┼── HTTP/WS ──►│  Master (内网 :8080)     │
+ │              │              │    ▲                      │
+ │  +--------+  │              │    │                      │
+ │  │Gateway │  │              │    │ WebSocket (出站)     │
+ │  │ 公网:8081│◄─┼── WS ──────┼────┘                      │
+ │  +--------+  │              │                          │
+ │   ▲     ▲    │              │                          │
+ │   │     │    │              └──────────────────────────┘
+ │   │     │    │
+ │ Agent1 Agent2│  (各目标机器上的 Agent 主动连接 Gateway)
+ │              │
+ └──────────────┘
 ```
+
+**部署步骤：**
+
+1. **内网 Master**：在内部网络的一台机器上运行 Master（Docker 或二进制），监听内网地址。
+2. **公网 Gateway**：在云服务器上运行 Gateway，配置 `MASTER_WS_URL` 指向内网 Master 的地址（通过专线/VPN/内网穿透）。
+3. **Agent 连接**：各目标机器上的 Agent 配置 `GATEWAY_URL` 指向公网 Gateway 地址。
 
 生产环境检查清单：
 
+### 安全配置
 - [ ] 设置强随机的 `JWT_SECRET`（如 `openssl rand -hex 32`）
 - [ ] 设置强 `ADMIN_PASSWORD`
 - [ ] 设置具体的 `AGENT_TOKENS`（不使用自动生成的值）
 - [ ] 设置 `MASTER_SECRET` 用于 Gateway 到 Master 的认证
 - [ ] 为 admin 账户启用 TOTP：`POST /api/setup-totp`
 - [ ] 配置 `IP_WHITELIST` 限制 Master 访问来源
-- [ ] 使用 nginx 反向代理并启用 TLS
-- [ ] 设置 `AUDIT_DIR` 到持久化且可备份的目录
 - [ ] 文件上传/下载路径被限制在 `/tmp/` 和 `/opt/multi-ops/`
+
+### Docker 部署
+- [ ] `.env` 文件已创建且权限设为 `0600`（`chmod 600 .env`）
+- [ ] `.env` 已加入 `.gitignore`，不会泄露到代码仓库
+- [ ] 审计日志卷 `master-audit` 正常工作（`docker compose ps` 查看）
+- [ ] 健康检查通过（`docker compose ps` 中 Master/Gateway 状态为 healthy）
+- [ ] 容器非 root 运行（Dockerfile 已设置 `USER nobody`）
+- [ ] 使用 nginx 反向代理并启用 TLS
+- [ ] Docker 主机防火墙仅开放 8080（Master）和 8081（Gateway）端口
+
+### 手动/裸机部署
+- [ ] 使用 nginx 反向代理并启用 TLS
+- [ ] 设置 `AUDIT_DIR` 到持久化且可备份的目录（权限 0700）
+- [ ] 审计日志文件权限 0600
+- [ ] Agent 以 systemd 服务运行，非 root 用户（推荐创建 `multi-ops` 用户）
 
 ## 角色说明
 

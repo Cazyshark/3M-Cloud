@@ -42,6 +42,9 @@ func NewLogger(logDir string) (*Logger, error) {
 }
 
 func (l *Logger) Log(entry Entry) {
+	if l == nil {
+		return
+	}
 	if entry.Timestamp.IsZero() {
 		entry.Timestamp = time.Now()
 	}
@@ -59,6 +62,9 @@ func (l *Logger) Log(entry Entry) {
 }
 
 func (l *Logger) Recent(n int) []Entry {
+	if l == nil {
+		return nil
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
