@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; connect-src 'self' ws: wss:; font-src 'self'; img-src 'self' data:;">
+    <title>Multi-Ops 多机运维看板</title>
+    <link rel="stylesheet" href="/style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"
+          integrity="sha256-gy8/LGA7Q61DUf8ElwFQzHqHMBQnbbEmpgZcbdgeSHI=" crossorigin="anonymous">
+</head>
+<body>
+    <!-- Toast Container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Login Page -->
+    <div id="login-page" class="login-page">
+        <div class="login-card">
+            <div class="login-logo">
+                <h1>Multi-Ops</h1>
+                <p>多机运维看板</p>
+            </div>
+            <form id="login-form" onsubmit="handleLogin(event)">
+                <div class="form-group">
+                    <label>用户名</label>
+                    <input type="text" id="login-user" placeholder="admin" required autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label>密码</label>
+                    <input type="password" id="login-pass" placeholder="输入密码" required autocomplete="current-password">
+                </div>
+                <div class="form-group" id="totp-group" style="display:none">
+                    <label>TOTP 验证码</label>
+                    <input type="text" id="login-totp" placeholder="6位数字" maxlength="6" autocomplete="one-time-code"
+                           pattern="[0-9]{6}" inputmode="numeric">
+                </div>
+                <div id="login-error" class="login-error"></div>
+                <button type="submit" class="btn btn-primary btn-block" id="login-btn">登录</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Main App -->
+    <div id="app-page" class="app-page" style="display:none">
+        <header>
+            <div class="logo">
+                <h1>Multi-Ops</h1>
+                <span class="subtitle">多机运维看板</span>
+            </div>
+            <div class="header-stats">
+                <div class="stat">
+                    <span class="stat-label">在线</span>
+                    <span class="stat-value" id="online-count">0</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">总数</span>
+                    <span class="stat-value" id="total-count">0</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">WebSocket</span>
+                    <span class="stat-value" id="ws-status" style="color:var(--yellow)">
+                        <span class="spinner"></span>
+                    </span>
+                </div>
+            </div>
+            <div class="header-actions">
+                <button onclick="showSetupTOTP()" class="btn btn-sm" title="TOTP 双因素设置">
+                    TOTP 设置
+                </button>
+                <button onclick="handleLogout()" class="btn btn-sm btn-danger" title="退出登录 (Esc)">
+                    退出
+                    <span class="shortcut-hint">Esc</span>
+                </button>
+            </div>
+        </header>
+
+        <main>
+            <!-- Left: Machine List -->
+            <section class="panel machines-panel">
+                <div class="panel-header">
+                    <h2>机器列表</h2>
+                    <div class="filter-bar">
+                        <input type="text" id="machine-filter" placeholder="搜索主机名 / IP / 标签..." autofocus>
+                        <select id="group-filter" class="select" onchange="renderMachineList()">
+                            <option value="">全部分组</option>
+                        </select>
+                        <button onclick="refreshMachines()" class="btn btn-sm" title="刷新机器列表 (R)">刷新</button>
+                    </div>
+                </div>
+                <div class="machine-list" id="machine-list">
+                    <div class="empty-state">
+                        <div class="empty-state-icon">&#x1F5A5;</div>
+                        等待机器连接...
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right: Work Area -->
+            <section class="panel work-panel">
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab('terminal')" title="终端 (1)">
+                        终端
+                        <span class="shortcut-hint">1</span>
+                    </button>
+                    <button class="tab" onclick="switchTab('exec')" title="批量执行 (2)">
+                        批量执行
+                        <span class="shortcut-hint">2</span>
+                    </button>
+                    <button class="tab" onclick="switchTab('upload')" title="文件分发 (3)">
+                        文件分发
+                        <span class="shortcut-hint">3</span>
+                    </button>
+                    <button class="tab" onclick="switchTab('history')" title="执行历史 (4)">
+                        执行历史
+                        <span class="shortcut-hint">4</span>
+                    </button>
+                    <button class="tab" onclick="switchTab('info')" title="机器详情 (5)">
+                        机器详情
+                        <span class="shortcut-hint">5</span>
+                    </button>
+                </div>
+
+                <!-- Terminal Tab -->
+                <div class="tab-content active" id="tab-terminal">
+                    <div class="terminal-toolbar">
+                        <select id="terminal-machine" class="select">
+                            <option value="">选择机器...</option>
+                        </select>
+                        <button onclick="openTerminal()" class="btn btn-primary" title="连接终端 (Enter)">连接终端</button>
+                        <button onclick="closeTerminal()" class="btn btn-danger">断开</button>
+                    </div>
+                    <div id="terminal-container"></div>
+                </div>
+
+                <!-- Exec Tab -->
+                <div class="tab-content" id="tab-exec">
+                    <div class="exec-panel">
+                        <div class="exec-targets">
+                            <h3>目标机器</h3>
+                            <div class="exec-actions">
+                                <button onclick="selectAllMachines()" class="btn btn-sm">全选</button>
+                                <button onclick="deselectAllMachines()" class="btn btn-sm">取消全选</button>
+                                <button onclick="selectOnlineMachines()" class="btn btn-sm">选择在线</button>
+                            </div>
+                            <div class="machine-checkboxes" id="exec-targets"></div>
+                        </div>
+                        <div class="exec-script">
+                            <h3>执行脚本</h3>
+                            <div class="exec-snippets">
+                                <button onclick="insertSnippet('sysinfo')" class="btn btn-sm">系统信息</button>
+                                <button onclick="insertSnippet('disk')" class="btn btn-sm">磁盘</button>
+                                <button onclick="insertSnippet('net')" class="btn btn-sm">网络</button>
+                                <button onclick="insertSnippet('process')" class="btn btn-sm">进程</button>
+                            </div>
+                            <textarea id="exec-script" rows="10" placeholder="输入要执行的 Shell 脚本..."
+                                      spellcheck="false"></textarea>
+                            <div class="exec-options">
+                                <label>超时(秒):
+                                    <input type="number" id="exec-timeout" value="60" min="0"
+                                           class="input" style="width:80px;padding:6px 8px">
+                                </label>
+                                <button onclick="executeScript()" class="btn btn-primary" id="exec-btn">
+                                    批量执行
+                                    <span class="shortcut-hint">Ctrl+Enter</span>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="exec-results">
+                            <h3>执行结果</h3>
+                            <div id="exec-output" class="output-area"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- File Upload Tab -->
+                <div class="tab-content" id="tab-upload">
+                    <div class="upload-panel">
+                        <div class="upload-targets">
+                            <h3>目标机器</h3>
+                            <div class="machine-checkboxes" id="upload-targets"></div>
+                        </div>
+                        <div class="upload-form">
+                            <h3>文件分发</h3>
+                            <div class="form-group">
+                                <label>远程路径 <span style="color:var(--text-muted);font-size:12px">(仅 /tmp/ 和 /opt/multi-ops/)</span></label>
+                                <input type="text" id="upload-path" placeholder="/tmp/script.sh" class="input">
+                            </div>
+                            <div class="form-group">
+                                <label>文件内容</label>
+                                <textarea id="upload-content" rows="10" class="textarea"
+                                          placeholder="粘贴文件内容..." spellcheck="false"></textarea>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>权限</label>
+                                    <input type="text" id="upload-mode" value="0644" class="input"
+                                           style="width:100px;padding:6px 8px">
+                                </div>
+                                <div class="form-group">
+                                    <label>
+                                        <input type="checkbox" id="upload-overwrite"> 覆盖已有文件
+                                    </label>
+                                </div>
+                            </div>
+                            <button onclick="uploadFile()" class="btn btn-primary" id="upload-btn">分发文件</button>
+                            <div id="upload-result" class="output-area" style="margin-top:12px;max-height:200px"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- History Tab -->
+                <div class="tab-content" id="tab-history">
+                    <div class="history-panel">
+                        <h3>执行历史</h3>
+                        <div id="history-list" class="history-list"></div>
+                    </div>
+                </div>
+
+                <!-- Info Tab -->
+                <div class="tab-content" id="tab-info">
+                    <div id="machine-info" class="info-panel">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">&#x1F50D;</div>
+                            点击左侧机器查看详情
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- TOTP Setup Modal -->
+    <div id="totp-modal" class="modal" style="display:none">
+        <div class="modal-content">
+            <h3>TOTP 两步验证设置</h3>
+            <p style="color:var(--text-secondary);margin-bottom:12px">使用 Google Authenticator / Authy 等工具扫描二维码或手动输入密钥</p>
+            <div class="totp-secret" id="totp-secret"></div>
+            <button onclick="copyToClipboard('totp-secret')" class="copy-btn" title="复制密钥">复制</button>
+            <div class="totp-url" id="totp-url"></div>
+            <button onclick="copyToClipboard('totp-url')" class="copy-btn" title="复制 URL">复制 URL</button>
+            <p class="text-muted">启用后，下次登录需要输入 TOTP 验证码</p>
+            <button onclick="closeTOTPModal()" class="btn">关闭</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"
+            integrity="sha256-8K6g919IVZATrmZDwked1zfSbaQtVSTm0rcJFa5lI8c=" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"
+            integrity="sha256-EPMZTF8XwXhvt9XbhlweyFObZzajGAY/04var3xGhI8=" crossorigin="anonymous"></script>
+    <script src="/app.js"></script>
+</body>
+</html>
